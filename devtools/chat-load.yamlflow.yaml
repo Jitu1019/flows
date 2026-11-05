@@ -1,0 +1,380 @@
+# Livestream chat load test for notification-service, for DevTools (https://dev.tools).
+# Each run of the chat-session flow is one buyer. It picks a test number at random from
+# ZOOP_CHAT_MOBILES and logs in with it, using the same OTP verify call as the auth flow.
+# It then opens the Socket.IO connection with that token, joins a stream's chat and posts
+# 12 messages, one every 5 s (about 60 s in total).
+# The load: scenarios at the bottom run many of these at once.
+#
+# Run:  npm run devtools:chat                          (one session, per-step table)
+#       SCENARIO=chat-smoke npm run devtools:chat-load  (load scenario)
+# A macOS dialog asks for the stream ID. It must be live or scheduled, not completed.
+# Setting ZOOP_STREAM_ID skips the dialog, for CI or scripted runs.
+# .env supplies ZOOP_CHAT_MOBILES (comma-separated test numbers) and ZOOP_TEST_OTP
+# (the bypass code).
+#
+# DevTools has no Socket.IO support, so the steps write Socket.IO v4 / Engine.IO v4
+# frames by hand:
+#   40{"accessToken":…}   connect to the root namespace (auth, as the buyer app sends it)
+#   420["signin",{…}]     emit with ack id 0  → server answers 430[err, data]
+#   421["sendMessage",…]  emit with ack id 1  → server answers 431[err, ok]
+#   3 and 42["pong"]      Engine.IO pong and the app-level pong. Without both the
+#                         server drops the socket after about 40 s
+#   41                    disconnect
+# The connection step only keeps the latest frame it received (Connect.message), so the
+# checks poll it. Under load, broadcasts from other users can overwrite an ack
+# before it is read. Those checks then pass as "unconfirmed" instead of failing.
+#
+# Format notes for CLI 1.6.1 (the docs page differs):
+# - ws_send names its connection with ws_connection_node_name, and wait takes duration_ms.
+# - A loop's body depends on Loop.loop. The step after the loop must depend on Loop.then;
+#   a plain "depends_on: Loop" never runs, and the run still exits 0.
+workspace_name: Zoop chat load
+active_environment: uat
+run:
+  - flow: chat-session
+environments:
+  - name: uat
+    description: Deployed UAT, through the load balancer. auth-service and notification-service share the host.
+    variables:
+      baseUrl: https://zoop-api-uat.zooplive.com
+      wsBaseUrl: wss://zoop-api-uat.zooplive.com
+  - name: qa
+    description: Deployed QA, through the load balancer. auth-service and notification-service share the host.
+    variables:
+      baseUrl: https://zoop-api-qa.zooplive.com
+      wsBaseUrl: wss://zoop-api-qa.zooplive.com
+flows:
+  - name: chat-session
+    steps:
+      - manual_start:
+          name: Start
+          position_x: 0
+          position_y: 0
+
+      # Fails closed: test numbers log in with the bypass code in production too.
+      # ws://localhost is allowed for a local mock server. Returns a per-session id that
+      # tags every message, and the test number this session logs in with.
+      # The numbers come from process.env, not {{ #env }}, because JS can't read #env.
+      - js:
+          name: Guard
+          depends_on: Start
+          position_x: 320
+          position_y: 0
+          code: |
+            export default function (context) {
+              const url = String(context.wsBaseUrl || "");
+              if (!/^(wss:\/\/|ws:\/\/(localhost|127\.0\.0\.1)[:/])/.test(url)) {
+                throw new Error("wsBaseUrl must be wss://, or ws://localhost: select an environment.");
+              }
+              const hosts = [url, String(context.baseUrl || "")].map((u) => u.split("/")[2] || "");
+              if (hosts.includes("zoop-api.zooplive.com")) {
+                throw new Error("Refusing to run against production.");
+              }
+              const mobiles = String(process.env.ZOOP_CHAT_MOBILES || "")
+                .split(",")
+                .map((m) => m.trim())
+                .filter((m) => /^\d{10}$/.test(m));
+              if (mobiles.length === 0) {
+                throw new Error("ZOOP_CHAT_MOBILES is not set: add comma-separated test numbers to .env.");
+              }
+              return {
+                session: Math.random().toString(36).slice(2, 8),
+                mobile: mobiles[Math.floor(Math.random() * mobiles.length)],
+              };
+            }
+
+      # The stream to chat in: ZOOP_STREAM_ID when set, else a macOS dialog.
+      # A JS step is cut off after 5 s, so AskStreamId opens the dialog in the background
+      # and the WaitStreamId loop polls for the answer. The state lives on the JS worker
+      # process, which outlives a single step:
+      # - Studio asks on every run, prefilled with the last answer.
+      # - A CLI process asks once and reuses the answer, so a load run shows one dialog.
+      - js:
+          name: AskStreamId
+          depends_on: Guard
+          position_x: 320
+          position_y: -260
+          code: |
+            export default function (context) {
+              const state = (process.__zoopStreamPrompt ??= {});
+              const fromEnv = String(process.env.ZOOP_STREAM_ID || "").trim();
+              if (fromEnv) {
+                state.result = { streamId: fromEnv };
+                return { source: "ZOOP_STREAM_ID" };
+              }
+              if (state.child) return { source: "dialog already open" };
+              const inStudio = process.execPath.includes("DevTools-Studio");
+              if (!inStudio && state.result) return { source: "answered earlier in this run" };
+
+              const { spawn } = process.getBuiltinModule("node:child_process");
+              state.result = null;
+              let out = "";
+              let err = "";
+              const child = spawn("osascript", [
+                "-e", "activate",
+                // Keep the dialog's reply in a variable: AppleScript's `result` is reset by the `if` below.
+                "-e", `set reply to display dialog "Stream ID to chat in (live or scheduled, not completed):" default answer "${state.last || ""}" with title "Zoop chat load" giving up after 120`,
+                "-e", 'if gave up of reply then error "No stream ID entered within 2 minutes."',
+                "-e", "text returned of reply",
+              ]);
+              child.stdout.on("data", (d) => (out += d));
+              child.stderr.on("data", (d) => (err += d));
+              child.on("error", (e) => {
+                state.child = null;
+                state.result = { error: `Couldn't open the stream ID dialog (${e.message}). Set ZOOP_STREAM_ID instead.` };
+              });
+              child.on("close", (code) => {
+                state.child = null;
+                if (code === 0) {
+                  state.result = { streamId: out.trim() };
+                  if (/^\d+$/.test(state.result.streamId)) state.last = state.result.streamId;
+                } else {
+                  // osascript reports "<from>:<to>: execution error: <message> (<code>)".
+                  const message = err.trim().replace(/^\d+:\d+: execution error: /, "").replace(/ \(-?\d+\)$/, "");
+                  state.result = { error: /\(-128\)/.test(err) ? "The stream ID dialog was cancelled." : message || `osascript exited with ${code}` };
+                }
+              });
+              state.child = child;
+              return { source: "dialog" };
+            }
+
+      - for:
+          name: WaitStreamId
+          depends_on: AskStreamId
+          position_x: 640
+          position_y: -260
+          iter_count: 250
+          break_condition: PollStreamId.done == true
+      - wait:
+          name: PollWait
+          depends_on: WaitStreamId.loop
+          position_x: 640
+          position_y: -60
+          duration_ms: 500
+      - js:
+          name: PollStreamId
+          depends_on: PollWait
+          position_x: 960
+          position_y: -60
+          code: |
+            export default function (context) {
+              return { done: Boolean(process.__zoopStreamPrompt?.result) };
+            }
+
+      - js:
+          name: CheckStreamId
+          depends_on: WaitStreamId.then
+          position_x: 960
+          position_y: -260
+          code: |
+            export default function (context) {
+              const result = process.__zoopStreamPrompt?.result;
+              if (!result) throw new Error("No stream ID entered within 2 minutes.");
+              if (result.error) throw new Error(result.error);
+              if (!/^\d+$/.test(result.streamId)) {
+                throw new Error(`The stream ID must be a number, got "${result.streamId}".`);
+              }
+              return { streamId: result.streamId };
+            }
+
+      # One login per session, like the app. Every login adds a session row in user-service.
+      # Tokens are two envelopes deep: auth-service wraps user-service's response.
+      - request:
+          name: Login
+          depends_on: CheckStreamId
+          position_x: 480
+          position_y: 200
+          method: POST
+          url: '{{ baseUrl }}/api/v1/auth/v2/otp/verify'
+          headers:
+            Accept: application/json
+          body:
+            type: json
+            json:
+              country_code: '+91'
+              mobile: '{{ Guard.mobile }}'
+              otp: '{{ #env:ZOOP_TEST_OTP }}'
+              user_type: buyer
+              device_id: null
+          assertions:
+            - response.status == 200
+            - response.body.data.data.access_token matches "^eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$"
+
+      - ws_connection:
+          name: Connect
+          depends_on: Login
+          position_x: 640
+          position_y: 0
+          url: '{{ wsBaseUrl }}/api/v1/notification/socket.io/?EIO=4&transport=websocket'
+
+      - ws_send:
+          name: Handshake
+          depends_on: Connect
+          position_x: 960
+          position_y: 0
+          ws_connection_node_name: Connect
+          message: '40{"accessToken":"{{ Login.response.body.data.data.access_token }}"}'
+
+      # The server verifies the token with user-service before it answers 40 (ok) or 44 (rejected).
+      - for:
+          name: WaitConnected
+          depends_on: Handshake
+          position_x: 1280
+          position_y: 0
+          iter_count: 50
+          break_condition: Connect.message startsWith '40' || Connect.message startsWith '44'
+      - wait:
+          name: PollConnected
+          depends_on: WaitConnected.loop
+          position_x: 1280
+          position_y: 200
+          duration_ms: 100
+
+      - js:
+          name: CheckConnected
+          depends_on: WaitConnected.then
+          position_x: 1600
+          position_y: 0
+          code: |
+            export default function (context) {
+              const frame = String(context.Connect?.message ?? "");
+              if (frame.startsWith("44")) {
+                throw new Error("Socket connect rejected: " + frame.slice(2));
+              }
+              if (!frame.startsWith("40")) {
+                throw new Error("No connect answer within 5 s. Last frame: " + frame.slice(0, 120));
+              }
+              return { sid: JSON.parse(frame.slice(2)).sid };
+            }
+
+      # user_id comes from the token. fullname is only the name shown in chat, so each session gets its own.
+      - ws_send:
+          name: SignIn
+          depends_on: CheckConnected
+          position_x: 1920
+          position_y: 0
+          ws_connection_node_name: Connect
+          message: '420["signin",{"room":"{{ CheckStreamId.streamId }}","user":"lt-{{ Guard.session }}","fullname":"Load {{ Guard.session }}","user_type":"buyer"}]'
+
+      - for:
+          name: WaitSignedIn
+          depends_on: SignIn
+          position_x: 2240
+          position_y: 0
+          iter_count: 50
+          break_condition: Connect.message startsWith '430'
+      - wait:
+          name: PollSignedIn
+          depends_on: WaitSignedIn.loop
+          position_x: 2240
+          position_y: 200
+          duration_ms: 100
+
+      - js:
+          name: CheckSignedIn
+          depends_on: WaitSignedIn.then
+          position_x: 2560
+          position_y: 0
+          code: |
+            export default function (context) {
+              const frame = String(context.Connect?.message ?? "");
+              if (frame.startsWith("430[null")) return { joined: true };
+              if (frame.startsWith("430")) {
+                throw new Error("signin rejected: " + JSON.parse(frame.slice(3))[0]);
+              }
+              return { joined: "unconfirmed" };
+            }
+
+      # Stops early if the latest frame is a rejected sendMessage
+      # (duplicate_message, abusive_message, Sign in to chat., blocked, …).
+      - for:
+          name: Chat
+          depends_on: CheckSignedIn
+          position_x: 2880
+          position_y: 0
+          iter_count: 12
+          break_condition: Connect.message startsWith '431["'
+      - ws_send:
+          name: SendMessage
+          depends_on: Chat.loop
+          position_x: 2880
+          position_y: 200
+          ws_connection_node_name: Connect
+          message: '421["sendMessage","{{ faker.sentence() }} · lt-{{ Guard.session }}"]'
+      - ws_send:
+          name: EnginePong
+          depends_on: SendMessage
+          position_x: 3200
+          position_y: 200
+          ws_connection_node_name: Connect
+          message: '3'
+      - ws_send:
+          name: AppPong
+          depends_on: EnginePong
+          position_x: 3520
+          position_y: 200
+          ws_connection_node_name: Connect
+          message: '42["pong"]'
+      - wait:
+          name: Pace
+          depends_on: AppPong
+          position_x: 3840
+          position_y: 200
+          duration_ms: 5000
+
+      - js:
+          name: CheckChat
+          depends_on: Chat.then
+          position_x: 3200
+          position_y: 0
+          code: |
+            export default function (context) {
+              const frame = String(context.Connect?.message ?? "");
+              if (frame.startsWith('431["')) {
+                throw new Error("sendMessage rejected: " + JSON.parse(frame.slice(3))[0]);
+              }
+              return { sent: context.Chat?.totalIterations };
+            }
+
+      - ws_send:
+          name: LeaveRoom
+          depends_on: CheckChat
+          position_x: 3520
+          position_y: 0
+          ws_connection_node_name: Connect
+          message: '42["leaveRoom",{"room":"{{ CheckStreamId.streamId }}"}]'
+      # Socket.IO hands events to handlers on the next tick, but runs a disconnect at once.
+      # Without this pause, a 41 in the same read drops the leaveRoom.
+      - wait:
+          name: LetLeaveLand
+          depends_on: LeaveRoom
+          position_x: 3840
+          position_y: 0
+          duration_ms: 300
+      - ws_send:
+          name: Disconnect
+          depends_on: LetLeaveLand
+          position_x: 4160
+          position_y: 0
+          ws_connection_node_name: Connect
+          message: '41'
+
+load:
+  # Two buyers, two sessions each: checks the setup before a real run.
+  - name: chat-smoke
+    flow: chat-session
+    executor: constant-vus
+    vus: 2
+    iterations: 4
+  # Ramps to 25 concurrent buyers in one stream: about 5 messages/s, each broadcast to all 25.
+  # Scale with --vus-scale (e.g. 4 → 100 buyers).
+  - name: chat-ramp
+    flow: chat-session
+    executor: ramping-vus
+    start_vus: 0
+    stages:
+      - { duration: 30s, target: 10 }
+      - { duration: 2m, target: 25 }
+      - { duration: 2m, target: 25 }
+      - { duration: 30s, target: 0 }
+    think_time: { min: 1s, max: 3s }

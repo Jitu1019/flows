@@ -1,0 +1,14 @@
+{
+  "name": "zoop-api-devtools",
+  "private": true,
+  "description": "DevTools (dev.tools) API flows for Zoop: the auth journey and the notification-service chat load test",
+  "engines": {
+    "node": ">=22.3"
+  },
+  "scripts": {
+    "devtools": "mkdir -p reports && set -a && . ./.env && set +a && devtools flow run devtools/auth.yamlflow.yaml --report console --report junit:reports/devtools-junit.xml",
+    "devtools:chat": "sh scripts/chat-load.sh chat-session",
+    "devtools:chat-load": "sh scripts/chat-load.sh --scenario ${SCENARIO:-chat-ramp}",
+    "studio": "sh scripts/studio.sh"
+  }
+}

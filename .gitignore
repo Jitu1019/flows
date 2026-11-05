@@ -1,0 +1,12 @@
+# Secrets: test numbers and the OTP bypass code, which works in production too
+.env
+!.env.example
+
+# Run output. JSON reports contain tokens, test numbers and the OTP.
+reports/
+
+# DevTools AI-check judge cache
+.devtools/
+
+node_modules/
+.DS_Store

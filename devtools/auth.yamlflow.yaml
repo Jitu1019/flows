@@ -1,0 +1,201 @@
+# Zoop auth journey for DevTools (https://dev.tools): login, profile, token rotation
+# and sign-out, plus the 401 cases.
+#
+# Run:  npm run devtools            (reads the test account from .env)
+# Open: DevTools Studio → Import → drop this file.
+#
+# Secrets are read with {{ #env:NAME }} directly in request fields. DevTools does
+# not resolve #env inside environment values, so they can't live there.
+# Switch target by changing active_environment (CLI) or the environment menu (Studio).
+workspace_name: Zoop API
+active_environment: uat
+run:
+  - flow: auth-journey
+environments:
+  - name: uat
+    description: Deployed UAT. auth-service and user-service share one host.
+    variables:
+      baseUrl: https://zoop-api-uat.zooplive.com
+      userBaseUrl: https://zoop-api-uat.zooplive.com
+      countryCode: '+91'
+      userType: buyer
+  - name: local
+    description: auth-service and user-service on this machine (OTP_LIVE=false, OTP 998877).
+    variables:
+      baseUrl: http://localhost:3000
+      userBaseUrl: http://localhost:8080
+      countryCode: '+91'
+      userType: buyer
+flows:
+  - name: auth-journey
+    steps:
+      - manual_start:
+          name: Start
+          position_x: 0
+          position_y: 0
+
+      # Fails closed: the test number's fixed OTP works in production too.
+      - js:
+          name: Guard
+          depends_on: Start
+          position_x: 320
+          position_y: 0
+          code: |
+            export default function (context) {
+              const baseUrl = String(context.baseUrl || "");
+              if (!/^https?:\/\//.test(baseUrl)) {
+                throw new Error("baseUrl is not set: select an environment.");
+              }
+              const hosts = [baseUrl, String(context.userBaseUrl || "")].map((url) => url.split("/")[2] || "");
+              if (hosts.includes("zoop-api.zooplive.com")) {
+                throw new Error("Refusing to run against production.");
+              }
+              return { hosts };
+            }
+
+      # login-happy-path ------------------------------------------------------
+      # Tokens are two envelopes deep: auth-service wraps user-service's response.
+      - request:
+          name: Login
+          depends_on: Guard
+          position_x: 640
+          position_y: 0
+          method: POST
+          url: '{{ baseUrl }}/api/v1/auth/v2/otp/verify'
+          headers:
+            Accept: application/json
+          body:
+            type: json
+            json:
+              country_code: '{{ countryCode }}'
+              mobile: '{{ #env:ZOOP_TEST_MOBILE }}'
+              otp: '{{ #env:ZOOP_TEST_OTP }}'
+              user_type: '{{ userType }}'
+              device_id: null
+          assertions:
+            - response.status == 200
+            - response.body.success == true
+            - response.body.data.data.access_token matches "^eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$"
+            - response.body.data.data.refresh_token matches "^eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$"
+            - response.body.data.data.expires_in > 0
+            - response.body.data.data.user_id != nil
+
+      - request:
+          name: GetProfile
+          depends_on: Login
+          position_x: 960
+          position_y: 0
+          method: GET
+          url: '{{ userBaseUrl }}/api/v1/user/{{ userType }}'
+          headers:
+            Accept: application/json
+            Authorization: 'Bearer {{ Login.response.body.data.data.access_token }}'
+          assertions:
+            - response.status == 200
+            - string(response.body.data.user.user_id) == string(Login.response.body.data.data.user_id)
+
+      # A JS step instead of an assertion: assertion failures print both values,
+      # and this must never print the test number.
+      - js:
+          name: ProfileIsTestNumber
+          depends_on: GetProfile
+          position_x: 1280
+          position_y: -200
+          code: |
+            export default function (context) {
+              const sent = JSON.parse(context.Login?.request?.body || "{}").mobile;
+              const profile = context.GetProfile?.response?.body?.data?.user?.mobile;
+              if (!sent || String(profile) !== String(sent)) {
+                throw new Error("Profile mobile is not the number that logged in.");
+              }
+              return { matches: true };
+            }
+
+      # refresh-token ---------------------------------------------------------
+      # refresh_token in the response is null unless the old one is near expiry.
+      - request:
+          name: RotateToken
+          depends_on: GetProfile
+          position_x: 1280
+          position_y: 0
+          method: POST
+          url: '{{ userBaseUrl }}/api/v1/user/rotate-token'
+          headers:
+            Accept: application/json
+          body:
+            type: json
+            json:
+              refresh_token: '{{ Login.response.body.data.data.refresh_token }}'
+          assertions:
+            - response.status == 200
+            - response.body.data.access_token matches "^eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$"
+            - response.body.data.token_type == "Bearer"
+            - response.body.data.refresh_token == nil || response.body.data.refresh_token matches "^eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$"
+
+      - request:
+          name: VerifyNewToken
+          depends_on: RotateToken
+          position_x: 1600
+          position_y: 0
+          method: POST
+          url: '{{ userBaseUrl }}/api/v1/user/verifyLoginToken'
+          headers:
+            Accept: application/json
+            Authorization: 'Bearer {{ RotateToken.response.body.data.access_token }}'
+          body:
+            type: json
+            json: {}
+          assertions:
+            - response.status == 200
+            - string(response.body.data.user.user_id) == string(Login.response.body.data.data.user_id)
+
+      # Well-formed JWT with a bad signature (401). A malformed one would get 422.
+      - request:
+          name: RotateForgedToken
+          depends_on: Guard
+          position_x: 640
+          position_y: 260
+          method: POST
+          url: '{{ userBaseUrl }}/api/v1/user/rotate-token'
+          headers:
+            Accept: application/json
+          body:
+            type: json
+            json:
+              refresh_token: eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoicmVmcmVzaCJ9.Zm9yZ2VkLXNpZ25hdHVyZQ
+          assertions:
+            - response.status == 401
+
+      # logout ----------------------------------------------------------------
+      # Sign out does not revoke the access token, so nothing asserts that.
+      - request:
+          name: SignOut
+          depends_on: VerifyNewToken
+          position_x: 1920
+          position_y: 0
+          method: POST
+          url: '{{ baseUrl }}/api/v1/auth/v2/signout'
+          headers:
+            Accept: application/json
+            Authorization: 'Bearer {{ Login.response.body.data.data.access_token }}'
+          body:
+            type: json
+            json: {}
+          assertions:
+            - response.status == 200
+            - response.body.success == true
+
+      - request:
+          name: SignOutWithoutToken
+          depends_on: Guard
+          position_x: 640
+          position_y: 480
+          method: POST
+          url: '{{ baseUrl }}/api/v1/auth/v2/signout'
+          headers:
+            Accept: application/json
+          body:
+            type: json
+            json: {}
+          assertions:
+            - response.status == 401
